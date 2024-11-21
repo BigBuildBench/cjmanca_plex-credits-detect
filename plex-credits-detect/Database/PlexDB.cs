@@ -1,0 +1,897 @@
+﻿using Spreads.DataTypes;
+using System;
+using System.Collections.Generic;
+using System.Data.SQLite;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace plexCreditsDetect.Database
+{
+    internal class PlexDB
+    {
+        SQLiteConnection sqlite_conn = null;
+        long TagID = -1;
+
+        long parentActivityID = -1;
+        long currentActivityID = -1;
+
+        string databasePath = "";
+
+        public class RootDirectory
+        {
+            public string path = "";
+            public long section_locations_id = -1;
+            public long section_type = -1;
+            public long library_section_id = -1;
+        }
+
+
+        Dictionary<long, RootDirectory> _RootDirectories = null;
+        public Dictionary<long, RootDirectory> RootDirectories
+        {
+            get
+            {
+                if (_RootDirectories == null)
+                {
+                    _RootDirectories = GetRootDirectories();
+                    if (_RootDirectories == null)
+                    {
+                        _RootDirectories = new Dictionary<long, RootDirectory>();
+                    }
+                    else
+                    {
+                        GetMovieRoots();
+                    }
+                }
+                return _RootDirectories;
+            }
+        }
+
+
+        public PlexDB()
+        {
+        }
+        public PlexDB(string path)
+        {
+            LoadDatabase(path);
+        }
+
+        public void LoadDatabase(string path)
+        {
+            databasePath = path;
+            if (path == null || path == "")
+            {
+                throw new ArgumentException("PlexDB.LoadDatabase - Invalid database path");
+            }
+
+            if (!File.Exists(path))
+            {
+                Console.WriteLine("PlexDB.LoadDatabase - Invalid database path");
+                throw new ArgumentException("Invalid database path");
+            }
+            SQLiteConnectionStringBuilder sb = new SQLiteConnectionStringBuilder();
+            sb.DataSource = path;
+            sb.Version = 3;
+            sb.FailIfMissing = true;
+            //sb.CacheSize = 0;
+            sb.JournalMode = SQLiteJournalModeEnum.Wal;
+
+            sqlite_conn = new SQLiteConnection(sb.ToString());
+
+            while (true)
+            {
+                try
+                {
+                    sqlite_conn.Open();
+                    break;
+                }
+                catch (SQLiteException e)
+                {
+                    if ((SQLiteErrorCode)e.ErrorCode != SQLiteErrorCode.Busy)
+                    {
+                        Console.WriteLine($"PlexDB LoadDatabase SQLite error code {e.ErrorCode}: {e.Message}");
+                        Program.Exit(-1);
+                    }
+                    Thread.Sleep(10);
+                }
+            }
+            ExecuteDBCommand("CREATE INDEX IF NOT EXISTS index_taggings_on_created_at ON taggings(created_at);");
+        }
+
+
+        public int ExecuteDBCommand(string cmd, Dictionary<string, object> p = null, int recursionCount = 0)
+        {
+            if (recursionCount > 20)
+            {
+                Console.WriteLine($"PlexDB not accessible. Retry count exceeded. Exiting.");
+                Program.Exit(-1);
+                return -1;
+            }
+
+            using (var sqlite_cmd = sqlite_conn.CreateCommand())
+            {
+                sqlite_cmd.CommandText = cmd;
+                sqlite_cmd.CommandType = System.Data.CommandType.Text;
+
+                if (p != null)
+                {
+                    foreach (var row in p)
+                    {
+                        sqlite_cmd.Parameters.Add(new SQLiteParameter("@" + row.Key, row.Value));
+                    }
+                }
+
+                int count = 0;
+
+                while (true)
+                {
+                    try
+                    {
+                        count++;
+                        int ret = sqlite_cmd.ExecuteNonQuery();
+                        return ret;
+                    }
+                    catch (SQLiteException ex)
+                    {
+                        if (count >= 2 + recursionCount)
+                        {
+                            Console.WriteLine($"PlexDB ExecuteDBCommand Database has been locked for a long time. Attempting to re-connect.");
+
+                            sqlite_cmd.Reset();
+                            sqlite_cmd.Dispose();
+
+                            CloseDatabase();
+                            LoadDatabase(databasePath);
+                            return ExecuteDBCommand(cmd, p, recursionCount + 1);
+                        }
+
+                        if ((SQLiteErrorCode)ex.ErrorCode != SQLiteErrorCode.Busy)
+                        {
+                            Console.WriteLine("PlexDB.ExecuteDBCommand exception: " + ex.Message + "" +
+                                " while executing SQL: " + cmd);
+                            if (p != null && p.Count > 0)
+                            {
+                                Console.WriteLine("With data: ");
+
+                                foreach (var x in p)
+                                {
+                                    Console.WriteLine($"{x.Key} = {x.Value}");
+                                }
+                            }
+                            Program.Exit(-1);
+                            return -1;
+                        }
+                        Thread.Sleep(10);
+                    }
+                }
+            }
+        }
+
+        public SQLResultInfo ExecuteDBQuery(string cmd, Dictionary<string, object> p = null, int recursionCount = 0)
+        {
+            if (recursionCount > 20)
+            {
+                Console.WriteLine($"PlexDB not accessible. Retry count exceeded. Exiting.");
+                Program.Exit(-1);
+                return null;
+            }
+            SQLResultInfo ret = new SQLResultInfo();
+
+            var sqlite_cmd = sqlite_conn.CreateCommand();
+            sqlite_cmd.CommandText = cmd;
+            sqlite_cmd.CommandType = System.Data.CommandType.Text;
+
+            if (p != null)
+            {
+                foreach (var row in p)
+                {
+                    sqlite_cmd.Parameters.Add(new SQLiteParameter("@" + row.Key, row.Value));
+                }
+            }
+
+            int count = 0;
+
+            while (true)
+            {
+                try
+                {
+                    count++;
+                    //var reader = sqlite_cmd.ExecuteReader(System.Data.CommandBehavior.KeyInfo);
+                    ret.reader = sqlite_cmd.ExecuteReader();
+
+                    for (var i = 0; i < ret.reader.FieldCount; i++)
+                    {
+                        ret.columns[ret.reader.GetName(i)] = i;
+                    }
+
+                    return ret;
+                }
+                catch (SQLiteException ex)
+                {
+                    if (count >= 2 + recursionCount)
+                    {
+                        Console.WriteLine($"PlexDB ExecuteDBQuery Database has been locked for a long time. Attempting to re-connect.");
+
+                        sqlite_cmd.Reset();
+                        sqlite_cmd.Dispose();
+
+                        CloseDatabase();
+                        LoadDatabase(databasePath);
+                        return ExecuteDBQuery(cmd, p, recursionCount + 1);
+                    }
+
+                    if ((SQLiteErrorCode)ex.ErrorCode != SQLiteErrorCode.Busy)
+                    {
+                        sqlite_cmd.Reset();
+                        sqlite_cmd.Dispose();
+
+                        Console.WriteLine("PlexDB.ExecuteDBQuery exception: " + ex.Message + "" +
+                            " while executing SQL: " + cmd);
+                        if (p != null && p.Count > 0)
+                        {
+                            Console.WriteLine("With data: ");
+
+                            foreach (var x in p)
+                            {
+                                Console.WriteLine($"{x.Key} = {x.Value}");
+                            }
+                        }
+                        Program.Exit(-1);
+                        return null;
+                    }
+                    Thread.Sleep(10);
+                }
+            }
+        }
+
+        public void CloseDatabase()
+        {
+            try
+            {
+                if (sqlite_conn != null && sqlite_conn.State != System.Data.ConnectionState.Closed)
+                {
+                    sqlite_conn.Close();
+                    sqlite_conn.Dispose();
+                }
+            }
+            catch { }
+
+            sqlite_conn = null;
+        }
+
+
+        public long GetTagID(bool secondTime = false)
+        {
+            if (TagID < 0)
+            {
+                using (var result = ExecuteDBQuery("SELECT id FROM tags WHERE tag_type = 12 LIMIT 1;"))
+                {
+                    if (!result.Read())
+                    {
+                        if (secondTime)
+                        {
+                            Console.WriteLine("Couldn't get intro tag_id from Plex Database. Make sure you've set up intro scanning and Plex has scanned at least one show. If you only have movie libraries, you'll need to create a TV Library temporarily with a show in it to get it to scan for intros once. These can be removed after it's successfully scanned for intros once.");
+
+                            Program.Exit(-1);
+                            return -1;
+                        }
+
+                        ExecuteDBCommand("INSERT INTO tags(`key`, extra_data, updated_at, created_at, user_music_url, user_art_url, user_thumb_url, tag_type, tag) VALUES('', '', DATE(), DATE(), '', '', '', 12, '');");
+
+                        return GetTagID(true);
+                    }
+
+                    TagID = result.Get<long>("id");
+                }
+
+                if (TagID < 0)
+                {
+                    Console.WriteLine("Couldn't get intro tag_id from Plex Database. Make sure you've set up intro scanning and Plex has scanned at least one show. If you only have movie libraries, you'll need to create a TV Library temporarily with a show in it to get it to scan for intros once. These can be removed after it's successfully scanned for intros once.");
+                    Program.Exit(-1);
+                    return -1;
+                }
+            }
+
+            return TagID;
+        }
+
+        public long GetMetadataID(Episode ep)
+        {
+            return GetMetadataID(ep.id);
+        }
+        public long GetMetadataID(string id)
+        {
+            using (var result = ExecuteDBQuery("SELECT metadata_item_id " +
+                " FROM media_items " +
+                " LEFT JOIN media_parts " +
+                " ON media_items.id = media_parts.media_item_id " +
+                " WHERE " +
+                " (media_parts.file LIKE @fileWin OR media_parts.file LIKE @fileLin) " +
+                " AND media_parts.file != '' AND media_parts.deleted_at IS NULL LIMIT 1;", new Dictionary<string, object>()
+                {
+                    { "fileWin", $"%{Program.GetWinStylePath(id)}" },
+                    { "fileLin", $"%{Program.GetLinuxStylePath(id)}" },
+                }))
+            {
+                if (!result.Read())
+                {
+                    return -1;
+                }
+
+                return result.Get<long>("metadata_item_id");
+            }
+        }
+
+        public Episode GetEpisodeForMetaID(long metadata_item_id)
+        {
+            return GetEpisodeForMetaID(new Episode(), metadata_item_id);
+        }
+        public Episode GetEpisodeForMetaID(Episode ep, long metadata_item_id)
+        {
+            using (var result = ExecuteDBQuery("SELECT file " +
+                " FROM media_parts " +
+                " LEFT JOIN media_items " +
+                " ON media_items.id = media_parts.media_item_id " +
+                " WHERE " +
+                " media_items.metadata_item_id = @metadata_item_id AND media_parts.file != '' AND media_parts.deleted_at IS NULL LIMIT 1;", new Dictionary<string, object>()
+                {
+                    { "metadata_item_id", metadata_item_id }
+                }))
+            {
+                if (!result.Read())
+                {
+                    return null;
+                }
+
+                ep.id = result.Get<string>("file");
+                ep.metadata_item_id = metadata_item_id;
+                ep.InPlexDB = true;
+
+                ep.Validate();
+
+                return ep;
+            }
+        }
+
+        public void DeleteExistingIntros(Episode ep)
+        {
+            DeleteExistingIntros(ep.metadata_item_id);
+        }
+
+        public void DeleteExistingIntros(long epMetaID)
+        {
+            long tagid = GetTagID();
+            if (epMetaID < 0 || tagid < 0)
+            {
+                return;
+            }
+            ExecuteDBCommand("DELETE FROM taggings WHERE `metadata_item_id` = @metadata_item_id AND `tag_id` = @tag_id AND `index` > 0;", new Dictionary<string, object>()
+            {
+                { "metadata_item_id", epMetaID },
+                { "tag_id", tagid }
+            });
+        }
+
+
+        public void Insert(long metadata_item_id, Segment segment, int index)
+        {
+            long tagid = GetTagID();
+
+            if (tagid < 0 || metadata_item_id < 0)
+            {
+                return;
+            }
+
+            ExecuteDBCommand("INSERT INTO taggings " +
+                "(`metadata_item_id`, `tag_id`, `index`, `text`, `time_offset`, `end_time_offset`, `thumb_url`, `created_at`,       `extra_data`) VALUES " +
+                "(@metadata_item_id,  @tag_id,  @index,  @text,  @time_offset,  @end_time_offset,  @thumb_url,   CURRENT_TIMESTAMP, @extra_data);", new Dictionary<string, object>()
+            {
+                { "metadata_item_id", metadata_item_id },
+                { "tag_id", tagid },
+                { "index", index },
+                { "text", "intro" },
+                { "time_offset", (int)(segment.start * 1000) },
+                { "end_time_offset", (int)(segment.end * 1000) },
+                { "thumb_url", "" },
+                { "extra_data", "pv%3Aversion=5" }
+            });
+
+        }
+
+        public int GetNonPlexIntroTimingsCount(long metadata_item_id)
+        {
+            long tagid = GetTagID();
+
+            if (tagid < 0 || metadata_item_id < 0)
+            {
+                return 0;
+            }
+
+            using (var result = ExecuteDBQuery("SELECT COUNT(*) as counted FROM taggings WHERE `metadata_item_id` = @metadata_item_id AND `tag_id` = @tag_id AND `index` > 0;", new Dictionary<string, object>()
+            {
+                { "metadata_item_id", metadata_item_id },
+                { "tag_id", tagid }
+            }))
+            {
+                if (!result.Read())
+                {
+                    return 0;
+                }
+
+                return result.Get<int>("counted");
+            }
+        }
+
+
+        public Segment GetPlexIntroTimings(long metadata_item_id)
+        {
+            long tagid = GetTagID();
+
+            if (tagid < 0 || metadata_item_id < 0)
+            {
+                return null;
+            }
+
+            using (var result = ExecuteDBQuery("SELECT `time_offset`, `end_time_offset` FROM taggings WHERE `metadata_item_id` = @metadata_item_id AND `tag_id` = @tag_id AND `index` = @index LIMIT 1;", new Dictionary<string, object>()
+            {
+                { "metadata_item_id", metadata_item_id },
+                { "tag_id", tagid },
+                { "index", 0 }
+            }))
+            {
+                if (!result.Read())
+                {
+                    return null;
+                }
+
+                Segment segment = new Segment();
+                segment.isCredits = false;
+                segment.isSilence = false;
+                segment.isBlackframes = false;
+
+                segment.start = result.Get<double>("time_offset") / 1000.0;
+                segment.end = result.Get<double>("end_time_offset") / 1000.0;
+
+                return segment;
+            }
+        }
+
+        public class RecentIntroData
+        {
+            public long metadata_item_id;
+            public Episode episode;
+            public Segment segment = new Segment();
+            public DateTime created;
+        }
+
+        public List<RecentIntroData> GetRecentPlexIntroTimingsSingleQuery(DateTime since)
+        {
+            long tagid = GetTagID();
+
+            if (tagid < 0)
+            {
+                return null;
+            }
+
+            using (var result = ExecuteDBQuery("SELECT taggings.metadata_item_id as metadata_item_id, media_parts.`file` as `file`, taggings.`time_offset` as `time_offset`, taggings.`end_time_offset` as `end_time_offset`, taggings.`created_at` as `created_at` " +
+                " FROM taggings " +
+                " INNER JOIN media_items ON taggings.metadata_item_id = media_items.metadata_item_id " +
+                " INNER JOIN media_parts ON media_items.id = media_parts.media_item_id " +
+                " WHERE taggings.`created_at` > @created_at AND taggings.`tag_id` = @tag_id AND taggings.`index` = @index AND media_parts.file != '' AND media_parts.deleted_at IS NULL" +
+                " ORDER BY created_at ASC;", new Dictionary<string, object>()
+            {
+                { "created_at", since },
+                { "tag_id", tagid },
+                { "index", 0 }
+            }))
+            {
+                if (!result.HasRows)
+                {
+                    return null;
+                }
+
+                List<RecentIntroData> ret = new List<RecentIntroData>();
+
+                while (result.Read())
+                {
+                    RecentIntroData data = new RecentIntroData();
+
+                    data.metadata_item_id = result.Get<long>("metadata_item_id");
+
+                    data.segment.start = result.Get<double>("time_offset") / 1000.0;
+                    data.segment.end = result.Get<double>("end_time_offset") / 1000.0;
+                    data.segment.isCredits = false;
+                    data.segment.isSilence = false;
+                    data.segment.isBlackframes = false;
+
+                    data.episode = new Episode(result.Get<string>("file"));
+
+                    data.episode.metadata_item_id = data.metadata_item_id;
+                    data.episode.InPlexDB = true;
+
+                    data.episode.plexTimings = data.segment;
+
+                    data.created = result.Get<DateTime>("created_at");
+
+                    ret.Add(data);
+                }
+
+                ret.Sort((a, b) => a.created.CompareTo(b.created)); // oldest to newest
+
+
+                return ret;
+            }
+        }
+        public List<RecentIntroData> GetRecentPlexIntroTimings(DateTime since)
+        {
+            long tagid = GetTagID();
+
+            if (tagid < 0)
+            {
+                return null;
+            }
+
+            using (var result = ExecuteDBQuery("SELECT metadata_item_id, `time_offset`, `end_time_offset`, `created_at` " +
+                "FROM taggings " +
+                "WHERE `created_at` > @created_at AND `tag_id` = @tag_id AND `index` = @index ORDER BY created_at ASC LIMIT 100;", new Dictionary<string, object>()
+            {
+                { "created_at", since },
+                { "tag_id", tagid },
+                { "index", 0 }
+            }))
+            {
+                if (!result.HasRows)
+                {
+                    return null;
+                }
+
+                List<RecentIntroData> ret = new List<RecentIntroData>();
+
+                while (result.Read())
+                {
+                    RecentIntroData data = new RecentIntroData();
+
+                    data.metadata_item_id = result.Get<long>("metadata_item_id");
+
+                    data.segment.start = result.Get<double>("time_offset") / 1000.0;
+                    data.segment.end = result.Get<double>("end_time_offset") / 1000.0;
+                    data.segment.isCredits = false;
+                    data.segment.isSilence = false;
+                    data.segment.isBlackframes = false;
+
+                    data.created = result.Get<DateTime>("created_at");
+
+                    data.episode = GetEpisodeForMetaID(data.metadata_item_id);
+
+                    ret.Add(data);
+                }
+
+                ret.Sort((a, b) => a.created.CompareTo(b.created)); // oldest to newest
+
+
+                return ret;
+            }
+        }
+
+
+
+        public void NewParentActivity()
+        {
+            EndActivity();
+
+            ExecuteDBCommand("INSERT INTO activities " +
+                "(`type`, `title`, `subtitle`, `started_at`, `cancelled`) VALUES " +
+                "(@type,  @title,  @subtitle,  @started_at,  @cancelled);", new Dictionary<string, object>()
+            {
+                { "type", "media.generate.intros" },
+                { "title", "Detecting credits" },
+                { "subtitle", "Detecting credits" },
+                { "started_at", (new DateTimeOffset(DateTime.Now)).ToUnixTimeSeconds() },
+                { "cancelled", 0 }
+            });
+
+            parentActivityID = sqlite_conn.LastInsertRowId;
+        }
+
+        public void NewActivity(string subtitle)
+        {
+            EndActivity();
+
+            if (parentActivityID < 0)
+            {
+                NewParentActivity();
+            }
+
+            ExecuteDBCommand("INSERT INTO activities " +
+                "(`parent_id`, `type`, `title`, `subtitle`, `started_at`, `cancelled`) VALUES " +
+                "(@parent_id,  @type,  @title,  @subtitle,  @started_at,  @cancelled);", new Dictionary<string, object>()
+            {
+                { "parent_id", parentActivityID },
+                { "type", "media.generate.intros" },
+                { "title", "Detecting credits" },
+                { "subtitle", subtitle },
+                { "started_at", (new DateTimeOffset(DateTime.Now)).ToUnixTimeSeconds() },
+                { "cancelled", 0 }
+            });
+
+            currentActivityID = sqlite_conn.LastInsertRowId;
+        }
+
+        public void EndActivity()
+        {
+
+            if (currentActivityID < 0)
+            {
+                return;
+            }
+
+            ExecuteDBCommand(" UPDATE activities SET " +
+                " `finished_at` =  @finished_at " +
+                " WHERE `id` = @id;", new Dictionary<string, object>()
+            {
+                { "finished_at", (new DateTimeOffset(DateTime.Now)).ToUnixTimeSeconds() },
+                { "id", currentActivityID }
+            });
+
+            currentActivityID = -1;
+        }
+
+
+        public class ShowSeasonInfo
+        {
+            public long showID = -1;
+            public long seasonID = -1;
+
+            public string showName = "";
+            public int seasonNumber = -1;
+            public string seasonName = "";
+        }
+
+        private bool GetMetadataItemByID(long metadata_item_id, ShowSeasonInfo ret)
+        {
+            if (metadata_item_id < 0)
+            {
+                return false;
+            }
+
+            using (var result = ExecuteDBQuery("SELECT `parent_id`, `metadata_type`, `title`, `index` FROM metadata_items WHERE `id` = @id LIMIT 1;", new Dictionary<string, object>()
+            {
+                { "id", metadata_item_id }
+            }))
+            {
+                if (!result.Read())
+                {
+                    return false;
+                }
+
+                int type = result.Get<int>("metadata_type");
+                string title = result.Get<string>("title");
+                int index = result.Get<int>("index");
+
+                switch (type)
+                {
+                    case 2: // show
+                        ret.showID = metadata_item_id;
+                        ret.showName = title;
+                        break;
+                    case 3: // season
+                        ret.showID = result.Get<int>("parent_id");
+                        ret.seasonID = metadata_item_id;
+                        ret.seasonName = title;
+                        ret.seasonNumber = index;
+                        break;
+                    case 4: //episode
+                        ret.seasonID = result.Get<int>("parent_id");
+                        break;
+                    default:
+                        return false;
+                }
+            }
+
+            return true;
+
+        }
+
+        private Dictionary<long, RootDirectory> GetRootDirectories()
+        {
+            Dictionary<long, RootDirectory> ret = new Dictionary<long, RootDirectory>();
+
+            using (var result = ExecuteDBQuery("SELECT * FROM section_locations;"))
+            {
+                if (!result.HasRows)
+                {
+                    return ret;
+                }
+
+                while (result.Read())
+                {
+                    try
+                    {
+                        if (result.Get<bool>("available"))
+                        {
+                            var root = new RootDirectory();
+                            root.path = result.Get<string>("root_path");
+                            root.section_locations_id = result.Get<long>("id");
+                            root.library_section_id = result.Get<long>("library_section_id");
+                            ret[root.section_locations_id] = root;
+                        }
+                    }
+                    catch (InvalidCastException ce)
+                    {
+                        Console.WriteLine($"A library section has invalid information: {result.Get<string>("root_path")}");
+                    }
+                }
+            }
+
+            return ret;
+        }
+
+        private Dictionary<long, string> GetMovieRoots()
+        {
+            Dictionary<long, string> ret = new Dictionary<long, string>();
+
+            using (var result = ExecuteDBQuery("SELECT * FROM library_sections;"))
+            {
+                if (!result.HasRows)
+                {
+                    return ret;
+                }
+
+                while (result.Read())
+                {
+                    long id = result.Get<long>("id");
+
+                    foreach (var item in RootDirectories)
+                    {
+                        if (item.Value.library_section_id == id)
+                        {
+                            RootDirectories[item.Key].section_type = result.Get<int>("section_type");
+                        }
+                    }
+                }
+            }
+
+            return ret;
+        }
+
+        public Dictionary<string, DateTime> GetRecentlyModifiedDirectories(DateTime since)
+        {
+            Dictionary<string, DateTime> ret = new Dictionary<string, DateTime>();
+
+            using (var result = ExecuteDBQuery("SELECT * FROM directories " +
+                " WHERE `updated_at` > @updated_at ORDER BY updated_at ASC LIMIT 100;", new Dictionary<string, object>()
+            {
+                { "updated_at", since }
+            }))
+            {
+                if (!result.HasRows)
+                {
+                    return ret;
+                }
+
+                while (result.Read())
+                {
+                    string dir = result.Get<string>("path");
+                    long library_section_id = result.Get<long>("library_section_id");
+                    bool valid = true;
+
+                    if (dir == "")
+                    {
+                        continue;
+                    }
+
+                    foreach (var item in RootDirectories)
+                    {
+                        if (item.Value.library_section_id == library_section_id)
+                        {
+                            dir = Program.PathCombine(Program.plexBasePathToLocalBasePath(item.Value.path), dir);
+                            ret[dir] = result.Get<DateTime>("updated_at");
+                        }
+                    }
+                }
+            }
+
+            return ret;
+        }
+
+        /*
+        public List<long> GetAllMetadataIDs()
+        {
+            List<long> ret = new List<long>();
+
+            using (var result = ExecuteDBQuery("SELECT id, library_section_id FROM metadata_items " +
+                " WHERE `metadata_type` = 1 OR `metadata_type` = 4;"))
+            {
+                if (!result.HasRows)
+                {
+                    return ret;
+                }
+
+                while (result.Read())
+                {
+                    long id = result.Get<long>("id");
+                    long library_section_id = result.Get<long>("library_section_id");
+
+                    if (RootDirectories.ContainsKey(library_section_id))
+                    {
+                        if (RootDirectories[library_section_id].section_type <= 2)
+                        {
+                            ret.Add(id);
+                        }
+                    }
+                }
+            }
+
+            return ret;
+        }
+        */
+
+
+
+        public List<Episode> GetAllMetadataIDs()
+        {
+            long tagid = GetTagID();
+
+            if (tagid < 0)
+            {
+                return null;
+            }
+
+            using (var result = ExecuteDBQuery("SELECT media_items.metadata_item_id as metadata_item_id, media_parts.`file` as `file`,  media_items.section_location_id as section_location_id " +
+                " FROM media_items INNER JOIN media_parts ON media_items.id = media_parts.media_item_id " +
+                " WHERE media_parts.file != '' AND media_parts.deleted_at IS NULL AND media_items.section_location_id IS NOT NULL GROUP BY media_parts.`file`"))
+            {
+                if (!result.HasRows)
+                {
+                    return null;
+                }
+
+                List<Episode> ret = new List<Episode>();
+
+                while (result.Read())
+                {
+                    long section_location_id = result.Get<long>("section_location_id");
+
+                    if (RootDirectories.ContainsKey(section_location_id))
+                    {
+                        if (RootDirectories[section_location_id].section_type <= 2)
+                        {
+                            Episode episode = new Episode(); // avoid validating right now for performance reasons
+
+                            episode.fullPath = result.Get<string>("file");
+                            episode.id = episode.fullPath;
+
+                            episode.metadata_item_id = result.Get<long>("metadata_item_id");
+                            episode.InPlexDB = true;
+
+                            ret.Add(episode);
+                        }
+                    }
+                }
+
+                return ret;
+            }
+        }
+
+
+
+
+        public ShowSeasonInfo GetShowAndSeason(long metadata_item_id)
+        {
+            ShowSeasonInfo ret = new ShowSeasonInfo();
+
+            if (GetMetadataItemByID(metadata_item_id, ret))
+            {
+                if (GetMetadataItemByID(ret.seasonID, ret))
+                {
+                    GetMetadataItemByID(ret.showID, ret);
+                }
+            }
+
+            return ret;
+        }
+
+
+    }
+}
